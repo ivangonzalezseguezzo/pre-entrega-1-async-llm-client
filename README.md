@@ -193,3 +193,42 @@ Para cambiar de proveedor alcanza con cambiar `"gemini"` por `"openai"` o `"anth
 - **Nota sobre `temperature` en Anthropic.** La versión actual de la Messages API de Anthropic (SDK
   `anthropic` 2.x) ya no acepta `temperature` ni `top_p`. Esos campos siguen validados en `ModelConfig`
   y se envían a OpenAI y Gemini, pero el cliente de Anthropic no los manda.
+
+## Criterios de evaluación
+
+Dónde se cumple cada criterio de la rúbrica de la pre-entrega, con el código y los tests que lo demuestran.
+
+### 1. Abstracción y gestión de proveedores (`AsyncLLMManager`) · 35 %
+
+- [`llm_client/manager.py`](llm_client/manager.py): la clase **`AsyncLLMManager`** elige el proveedor (OpenAI, Anthropic o Gemini) según la configuración: la variable `LLM_PROVIDER` del `.env` o `AsyncLLMManager.from_env("anthropic")`. El código que la usa siempre llama a `generate()` / `stream()`, sin saber qué proveedor hay detrás.
+- Factory `create_client()`: único lugar que decide qué clase concreta instanciar.
+- [`llm_client/base.py`](llm_client/base.py): `BaseLLMClient(ABC)` es el contrato común; `OpenAIClient`, `AnthropicClient` y `GeminiClient` lo implementan.
+- `FallbackClient` ([`llm_client/fallback.py`](llm_client/fallback.py)) cambia de proveedor en tiempo de ejecución si el principal falla.
+- Tests: `test_factory_crea_el_cliente_segun_el_proveedor`, `test_manager_con_fallbacks_usa_fallback_client`, `test_gemini_usa_el_endpoint_compatible_con_openai`.
+
+### 2. Streaming asíncrono · 25 %
+
+- `stream()` es un **generador asíncrono**: recorre el stream del SDK con `async for` y entrega cada fragmento con `yield` apenas llega ([`openai_client.py`](llm_client/openai_client.py), [`anthropic_client.py`](llm_client/anthropic_client.py)).
+- Usa los SDKs asíncronos oficiales (`AsyncOpenAI`, `AsyncAnthropic`) con `await`: nunca bloquea el event loop.
+- Si falla antes del primer token, reintenta o pasa al proveedor de respaldo; después del primer token no, para no duplicar texto ([`base.py`](llm_client/base.py)).
+- Demo en [`main.py`](main.py): "¿Qué es la entropía?" en modo streaming.
+- Tests: `test_stream_devuelve_tokens_de_a_uno`, `test_stream_reintenta_rate_limit_antes_del_primer_token`, `test_stream_con_rate_limit_persistente_lanza_error_controlado`, `test_fallback_en_streaming`.
+
+### 3. Validación de esquemas con Pydantic · 20 %
+
+- [`llm_client/schemas.py`](llm_client/schemas.py):
+  - `ModelConfig`: `temperature` entre 0 y 2, `max_tokens` entre 1 y 32000, `top_p` entre 0 y 1, `timeout` > 0, `max_retries` entre 0 y 10, y `provider` limitado a `openai` | `anthropic` | `gemini`. La API key es `SecretStr` (no se muestra al imprimir).
+  - `ChatMessage`: `role` limitado a system / user / assistant y `content` no vacío.
+  - `ModelResponse` y `LLMError`: la salida también tiene estructura validada.
+- Las variables del `.env` pasan por `ModelConfig`, así que un valor inválido falla con un mensaje claro **antes** de llamar a la API.
+- Tests: `test_temperature_fuera_de_rango`, `test_max_tokens_debe_ser_positivo`, `test_proveedor_inexistente`, `test_mensaje_vacio`, `test_api_key_oculta_al_imprimir`, `test_modelo_por_defecto`.
+
+### 4. Resiliencia y manejo de errores · 20 %
+
+- [`llm_client/base.py`](llm_client/base.py) captura `RateLimitError` (429), `APIConnectionError`, `APITimeoutError`, errores 5xx, de autenticación y de request, y los convierte en un `LLMError` estructurado (`type`, `message`, `retryable`, `status_code`, `attempts`).
+- **Reintentos con backoff exponencial + jitter** solo para errores transitorios; respeta el header `retry-after`.
+- **Fallback** automático al siguiente proveedor cuando uno se da por vencido ([`fallback.py`](llm_client/fallback.py)).
+- **Sin crash:** `generate()` nunca lanza errores de la API (devuelve `ModelResponse` con `ok == False`) y `stream()` lanza una única excepción controlada, `LLMClientError`. `main.py` lo demuestra con una API key inválida a propósito.
+- Tests (rate limit 429 simulado, sin red): `test_rate_limit_se_reintenta_y_luego_responde`, `test_rate_limit_persistente_devuelve_error_controlado`, `test_api_key_invalida_no_se_reintenta`, `test_falta_api_key_falla_claro`, `test_rate_limit_en_openai_responde_anthropic`, `test_si_fallan_todos_devuelve_error_sin_crash`, `test_sin_errores_no_usa_el_respaldo`, `test_gemini_key_invalida_se_clasifica_como_autenticacion`.
+
+Para correr todos los tests: `python -m unittest -v` (21 tests, sin red ni API keys).
